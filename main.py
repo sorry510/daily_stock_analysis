@@ -266,6 +266,10 @@ def run_full_analysis(
     这是定时任务调用的主函数
     """
     try:
+        # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
+        if stock_codes is None:
+            config.refresh_stock_list()
+
         # Issue #373: Trading day filter (per-stock, per-market)
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
@@ -350,7 +354,10 @@ def run_full_analysis(
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")
             if results:
-                dashboard_content = pipeline.notifier.generate_dashboard_report(results)
+                dashboard_content = pipeline.notifier.generate_aggregate_report(
+                    results,
+                    getattr(config, 'report_type', 'simple'),
+                )
                 parts.append(f"# 🚀 个股决策仪表盘\n\n{dashboard_content}")
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
@@ -392,9 +399,12 @@ def run_full_analysis(
                 if market_report:
                     full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
 
-                # 添加个股决策仪表盘（使用 NotificationService 生成）
+                # 添加个股决策仪表盘（使用 NotificationService 生成，按 report_type 分支）
                 if results:
-                    dashboard_content = pipeline.notifier.generate_dashboard_report(results)
+                    dashboard_content = pipeline.notifier.generate_aggregate_report(
+                        results,
+                        getattr(config, 'report_type', 'simple'),
+                    )
                     full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
 
                 # 3. 创建文档
@@ -497,6 +507,15 @@ def start_bot_stream_clients(config: Config) -> None:
             logger.error(f"[Main] Failed to start Feishu Stream client: {exc}")
 
 
+def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
+    """Scheduled runs should always read the latest persisted watchlist."""
+    if stock_codes is not None:
+        logger.warning(
+            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
+        )
+    return None
+
+
 def main() -> int:
     """
     主入口函数
@@ -566,7 +585,7 @@ def main() -> int:
     if args.serve_only:
         logger.info("模式: 仅 Web 服务")
         logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
-        logger.info("通过 /api/v1/analysis/stock/{code} 接口触发分析")
+        logger.info("通过 /api/v1/analysis/analyze 接口触发分析")
         logger.info(f"API 文档: http://{args.host}:{args.port}/docs")
         logger.info("按 Ctrl+C 退出...")
         try:
@@ -623,13 +642,17 @@ def main() -> int:
             search_service = None
             analyzer = None
 
-            if config.bocha_api_keys or config.tavily_api_keys or config.brave_api_keys or config.serpapi_keys:
+            if config.has_search_capability_enabled():
                 search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
+                    minimax_keys=config.minimax_api_keys,
+                    searxng_base_urls=config.searxng_base_urls,
+                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     news_max_age_days=config.news_max_age_days,
+                    news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
 
             if config.gemini_api_key or config.openai_api_key:
@@ -664,14 +687,38 @@ def main() -> int:
             logger.info(f"启动时立即执行: {should_run_immediately}")
 
             from src.scheduler import run_with_schedule
+            scheduled_stock_codes = _resolve_scheduled_stock_codes(stock_codes)
 
             def scheduled_task():
-                run_full_analysis(config, args, stock_codes)
+                run_full_analysis(config, args, scheduled_stock_codes)
+
+            background_tasks = []
+            if getattr(config, 'agent_event_monitor_enabled', False):
+                from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
+
+                monitor = build_event_monitor_from_config(config)
+                if monitor is not None:
+                    interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+
+                    def event_monitor_task():
+                        triggered = run_event_monitor_once(monitor)
+                        if triggered:
+                            logger.info("[EventMonitor] 本轮触发 %d 条提醒", len(triggered))
+
+                    background_tasks.append({
+                        "task": event_monitor_task,
+                        "interval_seconds": interval_minutes * 60,
+                        "run_immediately": True,
+                        "name": "agent_event_monitor",
+                    })
+                else:
+                    logger.info("EventMonitor 已启用，但未加载到有效规则，跳过后台提醒任务")
 
             run_with_schedule(
                 task=scheduled_task,
                 schedule_time=config.schedule_time,
-                run_immediately=should_run_immediately
+                run_immediately=should_run_immediately,
+                background_tasks=background_tasks,
             )
             return 0
 
